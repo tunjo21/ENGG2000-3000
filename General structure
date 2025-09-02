@@ -1,0 +1,34 @@
+// Motor driver pins (L298N)
+int motorIn1 = ;   // Motor driver input 1
+int motorIn2 = ;   // Motor driver input 2
+int motorEnable = ; // Motor driver enable pin (PWM)
+
+// Traffic light pins 
+int redLight = ; 
+int greenLight = ;
+
+// Ultrasonic sensor pins 
+int trigPin = ; 
+int echoPin = ;
+
+void setup() {
+  Serial.begin(115200);
+
+ // Motor driver pins
+  pinMode(motorIn1, OUTPUT);
+  pinMode(motorIn2, OUTPUT);
+  pinMode(motorEnable, OUTPUT);
+
+  // Traffic light pins
+  pinMode(redLight, OUTPUT);
+  pinMode(greenLight, OUTPUT);
+
+  // Ultrasonic pins
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  
+  // Start with green light ON
+  digitalWrite(greenLight, HIGH);
+  digitalWrite(redLight, LOW);
+}
+
