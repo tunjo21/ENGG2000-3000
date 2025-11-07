@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ESP32 Bridge Control</title>
+  <style>
+    :root {
+      --bg: #0f1220; --card: #151935; --ink: #e8ebff; --muted: #9aa3ff; --accent: #6c8cff; --good:#18c77a; --warn:#ffb020; --bad:#ff5562;
+    }
+    *{box-sizing:border-box}
+    body{margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Inter,Arial; background:var(--bg); color:var(--ink)}
+    .wrap{max-width:980px; margin:32px auto; padding:0 16px}
+    header{display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:20px}
+    h1{font-size:clamp(20px,3vw,28px); margin:0}
+    .card{background:var(--card); border:1px solid #222851; border-radius:16px; padding:16px; box-shadow:0 6px 30px rgba(0,0,0,.25)}
+    .row{display:grid; grid-template-columns:1fr 1fr; gap:16px}
+    @media (max-width:760px){.row{grid-template-columns:1fr}}
+    label{font-size:14px; color:var(--muted)}
+    input,button,select{font:inherit; color:inherit}
+    input[type=text]{width:100%; padding:12px 14px; border-radius:12px; border:1px solid #2a3063; background:#0f1330}
+    button{padding:12px 14px; border:0; border-radius:12px; background:#202761; cursor:pointer; transition:transform .05s ease}
+    button:hover{transform:translateY(-1px)}
+    .btn-row{display:flex; flex-wrap:wrap; gap:10px}
+    .btn-good{background:linear-gradient(180deg,#1b8f62,#12764f)}
+    .btn-warn{background:linear-gradient(180deg,#b27c08,#8f6506)}
+    .btn-bad{background:linear-gradient(180deg,#b02f3a,#8c242d)}
+    .pill{display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border-radius:999px; background:#1b2154; font-size:14px}
+    .dot{width:10px; height:10px; border-radius:50%}
+    .dot.green{background:var(--good)}
+    .dot.yellow{background:var(--warn)}
+    .dot.red{background:var(--bad)}
+    .grid{display:grid; grid-template-columns:repeat(3,1fr); gap:10px}
+    .stat{background:#0f1330; border:1px solid #2a3063; padding:12px; border-radius:12px; text-align:center}
+    .stat b{display:block; font-size:22px; margin-top:6px}
+    pre{white-space:pre-wrap; font-size:12px; color:#b9c1ff; background:#0f1330; border:1px solid #2a3063; padding:12px; border-radius:12px; max-height:240px; overflow:auto}
+    .footer{margin-top:20px; color:#7e87c5; font-size:12px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>ESP32 Bridge Control</h1>
+      <span id="netStatus" class="pill"><span class="dot red" id="netDot"></span><span id="netText">Disconnected</span></span>
+    </header>
+
+    <div class="card" style="margin-bottom:16px">
+      <div class="row">
+        <div>
+          <label for="ip">ESP32 IP address (same Wi‑Fi):</label>
+          <input id="ip" type="text" placeholder="e.g. 192.168.1.42" />
+        </div>
+        <div style="display:flex; align-items:flex-end; gap:10px">
+          <button id="saveIp">Save</button>
+          <button id="testIp">Test</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="card">
+        <h3 style="margin:0 0 12px 0">Manual Controls</h3>
+        <div class="btn-row">
+          <button class="btn-good" data-cmd="auto_on">Auto ON</button>
+          <button data-cmd="auto_off">Auto OFF</button>
+          <button data-cmd="raise">Raise</button>
+          <button data-cmd="lower">Lower</button>
+          <button class="btn-bad" data-cmd="stop">STOP</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin:0 0 12px 0">Status</h3>
+        <div class="btn-row" style="margin-bottom:12px">
+          <span class="pill"><span class="dot" id="lightDot"></span><span id="lightText">—</span></span>
+          <span class="pill">Bridge: <b id="bridgeText" style="margin-left:6px">—</b></span>
+          <span class="pill">Mode: <b id="modeText" style="margin-left:6px">—</b></span>
+        </div>
+        <div class="grid">
+          <div class="stat"><label>D1 (cm)</label><b id="d1">—</b></div>
+          <div class="stat"><label>D2 (cm)</label><b id="d2">—</b></div>
+          <div class="stat"><label>Min (cm)</label><b id="dmin">—</b></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h3 style="margin:0 0 12px 0">Event Log</h3>
+      <pre id="log"></pre>
+    </div>
+
+    <div class="footer">Tip: open this file on any device on the same Wi‑Fi as the ESP32. Data auto‑refreshes ~2×/sec.</div>
+  </div>
+
+  <script>
+    const ipEl = document.getElementById('ip');
+    const saveIpBtn = document.getElementById('saveIp');
+    const testIpBtn = document.getElementById('testIp');
+    const netDot = document.getElementById('netDot');
+    const netText = document.getElementById('netText');
+    const lightDot = document.getElementById('lightDot');
+    const lightText = document.getElementById('lightText');
+    const bridgeText = document.getElementById('bridgeText');
+    const modeText = document.getElementById('modeText');
+    const d1 = document.getElementById('d1');
+    const d2 = document.getElementById('d2');
+    const dmin = document.getElementById('dmin');
+    const logEl = document.getElementById('log');
+
+    const btns = Array.from(document.querySelectorAll('[data-cmd]'));
+
+    const LS_KEY = 'esp32_ip';
+    let BASE = '';
+
+    function setIP(v){
+      BASE = v ? `http://${v}` : '';
+      ipEl.value = v;
+    }
+
+    function log(msg){
+      const ts = new Date().toLocaleTimeString();
+      logEl.textContent = `[${ts}] ${msg}\n` + logEl.textContent;
+    }
+
+    function setNet(ok){
+      netDot.className = 'dot ' + (ok ? 'green' : 'red');
+      netText.textContent = ok ? 'Connected' : 'Disconnected';
+    }
+
+    function setLight(color){
+      lightDot.className = 'dot ' + (color||'');
+      lightText.textContent = color ? color.toUpperCase() : '—';
+    }
+
+    async function ping(){
+      if(!BASE) return setNet(false);
+      try{
+        const r = await fetch(BASE + '/');
+        setNet(r.ok);
+      }catch(e){ setNet(false); }
+    }
+
+    async function getState(){
+      if(!BASE) return;
+      try{
+        const r = await fetch(BASE + '/api/state');
+        if(!r.ok) throw new Error(r.statusText);
+        const j = await r.json();
+        bridgeText.textContent = j.bridge.replaceAll('_',' ').toUpperCase();
+        modeText.textContent = (j.auto_mode ? 'AUTO' : 'MANUAL');
+        d1.textContent = j.d1_cm; d2.textContent = j.d2_cm; dmin.textContent = j.min_cm;
+        const c = j.light;
+        setLight(c === 'red' ? 'red' : (c === 'yellow' ? 'yellow' : 'green'));
+        setNet(true);
+      }catch(e){ setNet(false); }
+    }
+
+    async function sendCmd(cmd){
+      if(!BASE) return alert('Set the ESP32 IP first.');
+      try{
+        const r = await fetch(BASE + '/api/cmd?action=' + encodeURIComponent(cmd), { method:'POST' });
+        if(!r.ok) throw new Error(await r.text());
+        const j = await r.json();
+        log('OK: ' + cmd + ' → ' + JSON.stringify(j));
+        await getState();
+      }catch(e){
+        log('ERR: ' + cmd + ' → ' + e.message);
+      }
+    }
+
+    // Wire UI
+    saveIpBtn.onclick = () => { localStorage.setItem(LS_KEY, ipEl.value.trim()); setIP(ipEl.value.trim()); log('Saved IP: '+ipEl.value.trim()); ping(); };
+    testIpBtn.onclick = () => { setIP(ipEl.value.trim()); ping(); getState(); };
+    btns.forEach(b => b.onclick = () => sendCmd(b.dataset.cmd));
+
+    // Init from localStorage or URL ?ip=...
+    const url = new URL(location.href);
+    const urlIP = url.searchParams.get('ip');
+    const saved = localStorage.getItem(LS_KEY);
+    setIP(urlIP || saved || '');
+    if(BASE){ ping(); getState(); }
+
+    // Poll
+    setInterval(() => { getState(); }, 500);
+  </script>
+</body>
+</html>
