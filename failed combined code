@@ -1,0 +1,317 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ===== Optional Wi-Fi (can leave as-is; not required for movement) =====
+#define ENABLE_WIFI false
+const char* ssid     = ".......";
+const char* password = ".......";
+
+// ===== Motor Driver Pins (L298N, Channel B used here) =====
+#define IN3 33
+#define IN4 32
+#define ENB 25   // If ENB jumper is ON on L298N, ENB pin can be ignored
+
+// ===== Ultrasonic Sensors (Boat detectors) =====
+// IMPORTANT: HC-SR04 ECHO is 5V — level shift or use resistor divider to ESP32 (not 5V tolerant)
+#define TRIG1 2
+#define ECHO1 4
+#define TRIG2 18
+#define ECHO2 19
+
+// ===== OPTIONAL Limit Switches =====
+// Wire switches to GND; use INPUT_PULLUP; LOW = pressed.
+// If you don't have them yet, leave as -1 and code will ignore.
+#define TOP_LIMIT_PIN     -1
+#define BOTTOM_LIMIT_PIN  -1
+
+// ===== Traffic Lights =====
+#define TL_RED    21
+#define TL_YELLOW 22
+#define TL_GREEN  23
+#define TL_RED    12
+#define TL_YELLOW 14
+#define TL_GREEN  27
+
+// ===== Web server (optional; harmless if ENABLE_WIFI=false) =====
+WebServer server(80);
+
+// ===== Motion / Bridge States =====
+enum Motion { DOWN, MOVING_UP, UP, MOVING_DOWN, STOPPED };
+Motion bridge = DOWN;
+
+// ===== Distance → Light thresholds (with hysteresis) =====
+// We compute min(distance1, distance2). Use these to map:
+//   RED    (boat very near)    -> bridge MUST be UP
+//   YELLOW (boat approaching)  -> bridge stays DOWN (cars cautious)
+//   GREEN  (no boat nearby)    -> bridge DOWN (cars go)
+const int RED_NEAR_CM        = 30;  // <= 30cm => RED
+const int RED_RELEASE_CM     = 40;  // back above this to exit RED  (hysteresis)
+
+const int YELLOW_NEAR_CM     = 60;  // <= 60cm => YELLOW (if not RED)
+const int YELLOW_RELEASE_CM  = 70;  // back above this to exit YELLOW
+
+// ===== Safety & Timing =====
+const unsigned long SENSE_PERIOD_MS = 120;  // ~8Hz combined sampling
+const unsigned long OPEN_TIME_MS     = 3500; // Tune to your mechanism
+const unsigned long CLOSE_TIME_MS    = 3500; // Tune to your mechanism
+
+// ===== Globals =====
+int distance1 = 999, distance2 = 999, minDistance = 999;
+unsigned long lastSenseMs = 0;
+unsigned long motionStartMs = 0;
+
+// ===== Disable PWM: simple enable via digitalWrite =====
+inline void enbWrite(uint8_t duty) { digitalWrite(ENB, duty > 0 ? HIGH : LOW); }
+
+// ===== Utility =====
+int measureOnce(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long us = pulseIn(echo, HIGH, 25000);       // 25 ms timeout
+  if (us == 0) return 999;                    // no echo
+  return (int)(us * 0.034 / 2.0);             // cm
+}
+
+// Median-of-3 to steady readings
+int measureDistance(int trig, int echo) {
+  int a = measureOnce(trig, echo); delayMicroseconds(200);
+  int b = measureOnce(trig, echo); delayMicroseconds(200);
+  int c = measureOnce(trig, echo);
+  int lo = min(a, min(b, c)), hi = max(a, max(b, c));
+  return a + b + c - lo - hi;
+}
+
+bool topLimit() {
+#if TOP_LIMIT_PIN >= 0
+  return digitalRead(TOP_LIMIT_PIN) == LOW;
+#else
+  return false;
+#endif
+}
+bool bottomLimit() {
+#if BOTTOM_LIMIT_PIN >= 0
+  return digitalRead(BOTTOM_LIMIT_PIN) == LOW;
+#else
+  return false;
+#endif
+}
+
+// ===== Lights =====
+enum Light { L_GREEN, L_YELLOW, L_RED };
+Light currentLight = L_GREEN;
+
+void setLights(Light L) {
+  currentLight = L;
+  digitalWrite(TL_RED,    L == L_RED);
+  digitalWrite(TL_YELLOW, L == L_YELLOW);
+  digitalWrite(TL_GREEN,  L == L_GREEN);
+
+   digitalWrite(TL2_RED,    L == L_RED);
+  digitalWrite(TL2_YELLOW, L == L_YELLOW);
+  digitalWrite(TL2_GREEN,  L == L_GREEN);
+}
+
+// Decide light using hysteresis so it doesn't flicker at boundaries
+void decideLight() {
+  if (currentLight == L_RED) {
+    // Stay RED until we get comfortably farther than RED_RELEASE_CM
+    if (minDistance > RED_RELEASE_CM) {
+      // Maybe drop to yellow if still close, else green
+      currentLight = (minDistance <= YELLOW_NEAR_CM) ? L_YELLOW : L_GREEN;
+    }
+  } else if (currentLight == L_YELLOW) {
+    if (minDistance <= RED_NEAR_CM) {
+      currentLight = L_RED;
+    } else if (minDistance > YELLOW_RELEASE_CM) {
+      currentLight = L_GREEN;
+    } // else stay yellow
+  } else { // L_GREEN
+    if (minDistance <= RED_NEAR_CM) {
+      currentLight = L_RED;
+    } else if (minDistance <= YELLOW_NEAR_CM) {
+      currentLight = L_YELLOW;
+    } // else stay green
+  }
+  setLights(currentLight);
+}
+
+// ===== Motor control =====
+void motorStop() {
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+  enbWrite(0);
+}
+
+void motorUp() {
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  enbWrite(255);
+}
+
+void motorDown() {
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  enbWrite(255);
+}
+
+// ===== High-level bridge commands with safety =====
+void startRaise() {
+  if (bridge == UP || bridge == MOVING_UP) return;
+  motorUp();
+  bridge = MOVING_UP;
+  motionStartMs = millis();
+}
+
+void startLower() {
+  if (bridge == DOWN || bridge == MOVING_DOWN) return;
+  motorDown();
+  bridge = MOVING_DOWN;
+  motionStartMs = millis();
+}
+
+void holdStopped() {
+  motorStop();
+  bridge = STOPPED; // transient; will be resolved to UP/DOWN after timing/limits
+}
+
+// ===== Sensor loop =====
+void sense() {
+  unsigned long now = millis();
+  if (now - lastSenseMs < SENSE_PERIOD_MS) return;
+  lastSenseMs = now;
+
+  distance1 = measureDistance(TRIG1, ECHO1);
+  distance2 = measureDistance(TRIG2, ECHO2);
+  minDistance = min(distance1, distance2);
+
+  decideLight(); // update lights based on distance
+}
+
+// ===== Bridge state machine driven by light =====
+void bridgeControl() {
+  // 1) Light policy:
+  //    RED    -> bridge UP (raise if not already)
+  //    YELLOW -> bridge DOWN (no movement if already down; close if up)
+  //    GREEN  -> bridge DOWN (no movement if already down; close if up)
+  bool wantUp = (currentLight == L_RED);
+  bool wantDown = (currentLight == L_YELLOW || currentLight == L_GREEN);
+
+  // 2) Enforce end conditions by time or limit switches
+  unsigned long now = millis();
+
+  switch (bridge) {
+    case DOWN:
+      if (wantUp) startRaise();
+      break;
+
+    case UP:
+      if (wantDown) startLower();
+      break;
+
+    case MOVING_UP:
+      if ((TOP_LIMIT_PIN >= 0 && topLimit()) || (now - motionStartMs >= OPEN_TIME_MS)) {
+        motorStop(); bridge = UP;
+      }
+      // If policy flips to DOWN while moving up (e.g., boat backed away quick), allow closing:
+      if (wantDown) { startLower(); }
+      break;
+
+    case MOVING_DOWN:
+      if ((BOTTOM_LIMIT_PIN >= 0 && bottomLimit()) || (now - motionStartMs >= CLOSE_TIME_MS)) {
+        motorStop(); bridge = DOWN;
+      }
+      // If policy flips to UP while moving down (boat arrives), allow opening:
+      if (wantUp) { startRaise(); }
+      break;
+
+    case STOPPED:
+      // Resolve STOPPED to a stable pose; default to DOWN if lights aren't red
+      if (wantUp)      { startRaise(); }
+      else /*wantDown*/{ startLower(); }
+      break;
+  }
+}
+
+// ===== Minimal REST (optional for debugging) =====
+void sendCORS(){ server.sendHeader("Access-Control-Allow-Origin","*"); }
+void handleRoot(){ sendCORS(); server.send(200,"text/plain","ESP32 Bridge OK"); }
+void handleState(){
+  sendCORS();
+  String json="{";
+  json += "\"bridge\":\""+String(bridge==DOWN?"down":bridge==MOVING_UP?"moving_up":bridge==UP?"up":bridge==MOVING_DOWN?"moving_down":"stopped")+"\",";
+  json += "\"light\":\""+String(currentLight==L_RED?"red":currentLight==L_YELLOW?"yellow":"green")+"\",";
+  json += "\"d1_cm\":"+String(distance1)+",\"d2_cm\":"+String(distance2)+",\"min_cm\":"+String(minDistance)+",";
+#if TOP_LIMIT_PIN >= 0
+  json += "\"top_limit\":" + String(topLimit() ? "true":"false") + ",";
+#else
+  json += "\"top_limit\":null,";
+#endif
+#if BOTTOM_LIMIT_PIN >= 0
+  json += "\"bottom_limit\":" + String(bottomLimit() ? "true":"false") + ",";
+#else
+  json += "\"bottom_limit\":null,";
+#endif
+  json += "\"uptime_ms\":"+String(millis());
+  json += "}";
+  server.send(200,"application/json",json);
+}
+
+// ===== Setup / Loop =====
+void setup() {
+  Serial.begin(115200);
+
+  // Motor
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  motorStop();
+
+  // Lights
+  pinMode(TL_RED, OUTPUT);
+  pinMode(TL_YELLOW, OUTPUT);
+  pinMode(TL_GREEN, OUTPUT);
+  pinMode(TL2_RED, OUTPUT);
+  pinMode(TL2_YELLOW, OUTPUT);
+  pinMode(TL2_GREEN, OUTPUT);
+  setLights(L_GREEN);
+
+  // Sensors
+  pinMode(TRIG1, OUTPUT); pinMode(ECHO1, INPUT);
+  pinMode(TRIG2, OUTPUT); pinMode(ECHO2, INPUT);
+
+#if TOP_LIMIT_PIN >= 0
+  pinMode(TOP_LIMIT_PIN, INPUT_PULLUP);
+#endif
+#if BOTTOM_LIMIT_PIN >= 0
+  pinMode(BOTTOM_LIMIT_PIN, INPUT_PULLUP);
+#endif
+
+  // Initial read so logic starts sensible
+  distance1 = measureDistance(TRIG1, ECHO1);
+  delay(60);
+  distance2 = measureDistance(TRIG2, ECHO2);
+  minDistance = min(distance1, distance2);
+  decideLight();              // set initial light from distance
+  bridge = DOWN;              // start with bridge down for cars
+
+#if ENABLE_WIFI
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
+  Serial.println("\nWiFi OK  IP: " + WiFi.localIP().toString());
+  server.on("/", handleRoot);
+  server.on("/api/state", handleState);
+  server.begin();
+  Serial.println("HTTP server started");
+#endif
+}
+
+void loop() {
+#if ENABLE_WIFI
+  server.handleClient();
+#endif
+
+  sense();            // read sensors, refresh light (with hysteresis)
+  bridgeControl();    // move bridge based on light policy
+}
