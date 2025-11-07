@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Vertical Lift Bridge Control</title>
+  <meta name="description" content="Control panel for ESP32 Vertical Lift Bridge" />
+  <style>
+    :root { --bg:#0b1020; --card:#0f172a; --muted:#94a3b8; --fg:#e2e8f0; --accent:#22d3ee; --danger:#ef4444; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 2rem;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji";
+      color: var(--fg); background: radial-gradient(1200px 600px at 20% -10%, #16213e 0%, transparent 60%),
+                         radial-gradient(900px 600px at 110% 10%, #0ea5e9 0%, transparent 50%),
+                         var(--bg);
+      min-height: 100vh;
+    }
+    .wrap { max-width: 860px; margin: 0 auto; }
+    .title { font-size: clamp(1.4rem, 2.6vw, 2rem); font-weight: 800; letter-spacing: 0.5px; display:flex; align-items:center; gap:.5rem;}
+    .subtitle { color: var(--muted); margin-top: .25rem; }
+    .card {
+      background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02));
+      border: 1px solid rgba(148,163,184,0.2);
+      border-radius: 18px; padding: 1.25rem; box-shadow: 0 12px 40px rgba(2,6,23,0.45);
+      backdrop-filter: blur(6px);
+    }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 1rem; }
+    @media (min-width: 720px){ .grid { grid-template-columns: 1fr 1fr; } }
+    .row { display:flex; gap:.5rem; flex-wrap: wrap; }
+    input, button, select {
+      padding: .8rem 1rem; border-radius: 12px; border: 1px solid rgba(148,163,184,0.25);
+      background: #0b132b; color: var(--fg); font-weight: 600;
+    }
+    input::placeholder { color: #64748b; }
+    button { cursor: pointer; transition: transform .05s ease; }
+    button:active { transform: translateY(1px); }
+    .btn { background: #0b132b; }
+    .btn.primary { background: linear-gradient(90deg, #0891b2, #06b6d4); border: none; color: #001018; }
+    .btn.warn { background: linear-gradient(90deg, #b91c1c, #ef4444); border: none; }
+    .pill { display:inline-flex; align-items:center; gap:.35rem; padding:.35rem .6rem; border-radius:999px; font-size: .9rem; background:#0b132b; border:1px solid rgba(148,163,184,0.25); color:var(--muted); }
+    .stat { display:flex; justify-content:space-between; padding:.6rem .8rem; background:#0b132b; border:1px solid rgba(148,163,184,0.25); border-radius:12px; }
+    .stat strong{ color: var(--fg); }
+    .sep { height:1px; background: rgba(148,163,184,0.2); margin: .75rem 0; }
+    .log { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#0b132b; border:1px solid rgba(148,163,184,0.25); border-radius:12px; padding:.75rem; min-height:120px; max-height:200px; overflow:auto; white-space:pre-wrap; }
+    a.muted { color: var(--muted); text-decoration: underline dotted; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="title">Vertical Lift Bridge Control <span class="pill" id="status">Disconnected</span></div>
+    <div class="subtitle">Send OPEN / CLOSE / STOP commands to your ESP32 and see live status.</div>
+
+    <div class="card" style="margin-top:1rem;">
+      <div class="grid">
+        <div>
+          <div class="row">
+            <input id="host" placeholder="ESP32 host (e.g. 192.168.1.42)" />
+            <input id="proto" value="http" style="max-width:120px" />
+            <button class="btn" onclick="saveHost()">Save</button>
+          </div>
+          <div class="row" style="margin-top:.5rem;">
+            <button class="btn primary" onclick="sendCmd('open')">OPEN</button>
+            <button class="btn" onclick="sendCmd('close')">CLOSE</button>
+            <button class="btn warn" onclick="sendCmd('stop')">STOP</button>
+          </div>
+          <div class="sep"></div>
+          <div class="stat"><span>Motion</span><strong id="motion">-</strong></div>
+          <div class="stat"><span>Top Limit</span><strong id="top">-</strong></div>
+          <div class="stat"><span>Bottom Limit</span><strong id="bot">-</strong></div>
+          <div class="stat"><span>Uptime</span><strong id="uptime">-</strong></div>
+        </div>
+
+        <div>
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="pill">State feed</div>
+            <select id="poll" onchange="setPoll()">
+              <option value="800">Refresh: 0.8s</option>
+              <option value="1500" selected>Refresh: 1.5s</option>
+              <option value="2500">Refresh: 2.5s</option>
+              <option value="0">Refresh: Off</option>
+            </select>
+          </div>
+          <div class="log" id="log"></div>
+          <div class="subtitle" style="margin-top:.25rem;">
+          //  Note: If this page is hosted separately from the ESP32, your ESP32 must send CORS headers for <code>/api/*</code>
+            (e.g. <code>Access-Control-Allow-Origin: *</code>), or serve this file directly from the ESP32.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="subtitle" style="margin-top:1rem;">
+      Endpoints used: <code>/api/command?cmd=open|close|stop</code> and <code>/api/state</code> returning JSON.<br/>
+      ESP32 example firmware available upon request.
+    </div>
+  </div>
+
+<script>
+let baseUrl = "";
+let pollTimer = null;
+
+function $(id){ return document.getElementById(id); }
+function log(s){ const el=$('log'); el.textContent += s + "\n"; el.scrollTop = el.scrollHeight; }
+function setStatus(s){ $('status').textContent = s; }
+
+function loadHost(){
+  const saved = localStorage.getItem('bridge_host') || "";
+  const proto = localStorage.getItem('bridge_proto') || "http";
+  $('host').value = saved;
+  $('proto').value = proto;
+  configureBaseUrl();
+}
+function saveHost(){
+  localStorage.setItem('bridge_host', $('host').value.trim());
+  localStorage.setItem('bridge_proto', $('proto').value.trim() || 'http');
+  configureBaseUrl();
+  ping();
+}
+function configureBaseUrl(){
+  const host = $('host').value.trim();
+  const proto = $('proto').value.trim() || 'http';
+  baseUrl = host ? `${proto}://${host}` : "";
+}
+
+async function fetchState(){
+  if (!baseUrl){ setStatus('No host'); return; }
+  try {
+    const res = await fetch(`${baseUrl}/api/state`, { method:'GET' });
+    if (!res.ok) throw new Error('HTTP '+res.status);
+    const data = await res.json();
+    $('motion').textContent = data.motion ?? '-';
+    $('top').textContent = (data.top_limit ? 'HIT' : 'clear');
+    $('bot').textContent = (data.bottom_limit ? 'HIT' : 'clear');
+    $('uptime').textContent = ((data.uptime_ms||0)/1000|0) + 's';
+    setStatus('Connected');
+  } catch (e) {
+    setStatus('Disconnected');
+  }
+}
+
+async function sendCmd(cmd){
+  if (!baseUrl) return alert('Set ESP32 host first.');
+  try {
+    const res = await fetch(`${baseUrl}/api/command?cmd=${encodeURIComponent(cmd)}`, { method:'GET' });
+    const data = await res.json().catch(()=>({}));
+    if (res.ok && data.ok === true){
+      log(`→ command: ${cmd}`);
+      fetchState();
+    } else {
+      log(`! command failed: ${cmd} (${data.error||res.status})`);
+      alert('Command failed.');
+    }
+  } catch (e) {
+    log('! network error sending '+cmd);
+    alert('Network error.');
+  }
+}
+
+function setPoll(){
+  const v = parseInt($('poll').value,10);
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (v > 0){
+    pollTimer = setInterval(fetchState, v);
+  }
+}
+
+async function ping(){
+  await fetchState();
+}
+
+loadHost();
+setPoll();
+</script>
+</body>
+</html>
+
